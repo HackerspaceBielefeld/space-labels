@@ -1,0 +1,224 @@
+#! /bin/env python3
+
+# SEHR einfaches experimentelles Webinterface zur Erstellung von
+# QRcode-Etiketten mit Mediawiki-Links -- Work In Progress ...
+
+# settings
+url      = "https://wiki.hackerspace-bielefeld.de/index.php?title=DinA1-Drucker"
+title    = "Din A1 Drucker"
+
+debug    = False
+
+model    = "QL-810W"
+backend  = "network"
+#address  = "tcp://192.168.23.161"
+address  = "tcp://10.42.0.161"
+
+label    = "62"
+label_w  = 696
+label_h  = 400
+
+fontname = "OpenSans-Regular.ttf"
+
+white    = (255,255,255)
+red      = (255,0,0)
+black    = (0,0,0)
+
+HTTP_PORT = 8001
+
+# pip3 install pillow
+from PIL import Image, ImageDraw, ImageFont
+
+# pip3 install segno
+# pip3 install qrcode-artistic -> for adding to_pil()
+from segno import make_qr
+
+# pip3 install brother_ql
+from brother_ql.raster import BrotherQLRaster
+from brother_ql.conversion import convert
+from brother_ql.backends.helpers import send
+
+# http related stuff
+import http.server
+import socketserver
+from urllib.parse import urlparse, parse_qs
+
+from math import floor
+from io import BytesIO
+
+class MyRequestHandler(http.server.BaseHTTPRequestHandler):
+    
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        
+        if path == '/':
+            self.handle_root()
+        elif path == '/label':
+            self.handle_label(parsed_path.query)
+        else:
+            self.handle_not_found()
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+
+        if path == '/submit-form':
+            self.handle_form_submission()
+        else:
+            self.handle_not_found()
+
+    def send_html_response(self, status_code, html_content):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(bytes(html_content, "utf8"))
+
+    def handle_root(self):
+        """Handles requests to the root URL ('/'). Now includes a POST form."""
+        message = """
+        <html>
+            <head><title>Dynamic Server</title></head>
+            <body>
+                <h1>Welcome to the Dynamic Python Server!</h1>
+                <p>This server can run Python code based on the URL.</p>
+                
+                <h2>GET Examples:</h2>
+                <ul>
+                    <li><a href="/greet?name=World">Greet the World</a></li>
+                    <li><a href="/add?a=10&b=5">Add two numbers (10 + 5)</a></li>
+                </ul>
+
+                <hr>
+
+                <h2>POST Example:</h2>
+                <form action="/submit-form" method="POST">
+                    <label for="name">Enter your name:</label><br>
+                    <input type="text" id="name" name="username"><br><br>
+                    <input type="submit" value="Submit">
+                </form>
+            </body>
+        </html>
+        """
+        self.send_html_response(200, message)
+
+    def serve_pil_image(self, pil_img):
+        img_io = BytesIO()
+        pil_img.save(img_io, 'PNG')
+        return img_io.getvalue()
+        
+    def handle_label(self, query):
+        params = parse_qs(query)
+        title = params.get('title')[0]
+        url = params.get('url')[0]
+
+        img = render_label(title, url)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'image/png')
+        self.end_headers()
+        self.wfile.write(self.serve_pil_image(img))
+        
+        
+    def handle_form_submission(self):
+        """Handles the submission of the POST form."""
+        try:
+            # Get the size of the POST data.
+            content_length = int(self.headers['Content-Length'])
+            # Read the data from the request body.
+            post_data_bytes = self.rfile.read(content_length)
+            # Decode the byte string into a UTF-8 string.
+            post_data_str = post_data_bytes.decode('utf-8')
+            # Parse the form data.
+            params = parse_qs(post_data_str)
+            
+            username = params.get('username', ['anonymous'])[0]
+
+            message = f"""
+            <html>
+                <body>
+                    <h1>Thank You, {username}!</h1>
+                    <p>Your submission was received via a POST request.</p>
+                    <p><a href="/">Go back</a></p>
+                </body>
+            </html>
+            """
+            self.send_html_response(200, message)
+        except Exception as e:
+            error_message = f"""
+            <html>
+                <body>
+                    <h1>Error processing request!</h1>
+                    <p>An error occurred: {e}</p>
+                    <p><a href="/">Go back</a></p>
+                </body>
+            </html>
+            """
+            self.send_html_response(500, error_message)
+
+
+    def handle_not_found(self):
+        """Handles all other requests by sending a 404 Not Found error."""
+        message = """
+        <html>
+            <body>
+                <h1>404 - Not Found</h1>
+                <p>The requested page does not exist.</p>
+                <p><a href="/">Go back to the homepage</a></p>
+            </body>
+        </html>
+        """
+        self.send_html_response(404, message)
+
+def render_label(title, url, icons = []):
+    # generate label image and drawing context
+    img  = Image.new("RGB", (label_w, label_h), white)
+    draw = ImageDraw.Draw(img)
+
+    # generate QR code
+    if not url.startswith("http"):
+        url = "https://wiki.hackerspace-bielefeld.de/index.php?title=" + url
+    qrcode = make_qr(url)
+
+    # determine QR code size
+    (qr_w,qr_h) = qrcode.symbol_size(1,0)
+
+    # determine largest QR code scale factor that still fits the label
+    scale = floor(240 / max(qr_w,qr_h))
+
+    # generate actual QR code image
+    qr_img = qrcode.to_pil(scale=scale,border=0)
+
+    # add QR code image label at top left
+    img.paste(qr_img, (10, 140))
+
+    # add title text
+    draw.rounded_rectangle((1, 20, 694, 120), fill=white, outline=black,
+                               width=3, radius=7)
+
+    font_1 = ImageFont.truetype(fontname, 96);
+    draw.multiline_text((10, 0), title, fill=red, font=font_1)
+
+    #add some extra icon
+    with Image.open("kosten.png") as warning:
+        warning.load()
+    img.paste(warning, (390, 170))
+
+    return img
+
+
+Handler = MyRequestHandler
+
+httpd = socketserver.TCPServer(("", HTTP_PORT), Handler)
+
+print(f"Serving dynamically at http://localhost:{HTTP_PORT}")
+print("Press Ctrl+C to stop the server.")
+
+try:
+    httpd.serve_forever()
+except KeyboardInterrupt:
+    print("\nStopping the server...")
+    httpd.shutdown()
+    httpd.server_close()
+    print("Server stopped successfully.")
+
